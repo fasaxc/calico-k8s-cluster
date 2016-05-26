@@ -2,6 +2,7 @@
 # local-settings.mk.
 CLUSTER_SIZE:=2
 ETCD_CLUSTER_SIZE:=3
+NUM_PODS:=300
 GCE_REGION:=us-central1-f
 GCE_PROJECT:=unique-caldron-775
 GCE_IMAGE_NAME:=coreos-alpha-1010-1-0-v20160407
@@ -9,8 +10,11 @@ MASTER_INSTANCE_TYPE:=n1-standard-16
 NODE_INSTANCE_TYPE:=n1-highcpu-4
 ETCD_INSTANCE_TYPE:=n1-standard-16
 PROM_INSTANCE_TYPE:=n1-standard-4
+RR_INSTANCE_TYPE:=n1-standard-4
 PREFIX:=kube-scale
 NODE_IMAGE:=calico/node:v0.19.0
+GETTER_IMAGE:=caseydavenport/scale-tester:latest
+
 # Whether to use the unpacked CNI plugin (rather than the one-file, packed
 # version).  "y" or "n".  Note: this URL is for an experimental, unreleased
 # version of the plugin.  The purpose of this flag is to test whether using
@@ -27,6 +31,8 @@ GRAFANA_DB_URL:=https://storage.googleapis.com/calico-scale-testing-files/grafan
 
 # GCE bucket we use to store files we need to transfer to hosts.
 GCE_BUCKET:=$(PREFIX)-data
+# Number of nginx pod instances to create
+NGINX_INSTANCES:=$(shell echo ${CLUSTER_SIZE}/10 + 1 | bc)
 
 # Generate node names.
 NODE_NUMBERS := $(shell seq -f '%02.0f' 1 $(CLUSTER_SIZE))
@@ -57,9 +63,8 @@ OS := $(shell uname -s | tr A-Z a-z)
 CURRENT_DIR := $(shell pwd)
 
 # Make a list of diags targets
-DIAGS_TARGETS := $(NODE_NUMBERS) $(ETCD_NODE_SUFFIXES) master prom
+DIAGS_TARGETS := $(NODE_NUMBERS) $(ETCD_NODE_SUFFIXES) master prom rr1 rr2
 LOG_RETRIEVAL_TARGETS := $(addprefix job,${DIAGS_TARGETS})
-PODS := 10000
 
 kubectl:
 	wget http://storage.googleapis.com/kubernetes-release/release/v1.2.0/bin/$(OS)/amd64/kubectl
@@ -96,21 +101,59 @@ remove-pinger:
 scale-pinger:
 	kubectl scale --replicas=10000 rc/pinger
 
+prepare-getter:
+	# Make sure policy is applied by attempting to create it again
+	-cd $(CURRENT_DIR)/policy-scale-test && ./policy create -f nginx-policy.yaml
+	# Create all the namespaces and RCs
+	cd $(CURRENT_DIR)/policy-scale-test && ./start.sh
+	$(MAKE) --no-print-directory scale-nginx
+
+scale-nginx:
+	kubectl scale rc nginx-server --replicas=$(NGINX_INSTANCES)
+	echo 'Now use make "gce-successful-pods" to check they are all running'
+
+scale-getter:
+	echo 'Scaling up number of getter pods to $(NUM_PODS)'
+	kubectl scale rc getter --replicas=$(NUM_PODS)
+	echo 'Now use "make gce-successful-pods" to check they are all running'
+
+get-results:
+	bash -c 'source ../env/bin/activate && cd $(CURRENT_DIR)/policy-scale-test && python get-data.py | tee testdata/result.txt'
+
 # See http://stackoverflow.com/a/12110773/61318
 #make -j12 get-diags
-get-diags: $(LOG_RETRIEVAL_TARGETS)
+get-diags: describe-nodes describe-pods describe-services describe-rc describe-ep get-prom-data $(LOG_RETRIEVAL_TARGETS) get-pod-logs
+
+get-prom-data:
 	-ssh -A -o LogLevel=quiet core@$(PREFIX)-master.$(GCE_REGION).$(GCE_PROJECT) ssh -o LogLevel=quiet -o StrictHostKeyChecking=no $(PREFIX)-prom sudo tar -cvzf - /var/log/prom_data > timings/prom_data.tgz
+
+get-pod-logs:
+	-kubectl get pods | grep getter | cut -f 1 -d " " | xargs -iPOD sh -c 'kubectl logs POD | gzip > timings/POD.log.gz &'
 
 $(LOG_RETRIEVAL_TARGETS): job%:
 	@mkdir -p timings
-	-ssh -A -o LogLevel=quiet core@$(PREFIX)-master.$(GCE_REGION).$(GCE_PROJECT) ssh -o LogLevel=quiet -o StrictHostKeyChecking=no $(PREFIX)-$* sudo tar -cvzf - /var/log/calico > timings/logs-$*.tgz &
-	-ssh -A -o LogLevel=quiet core@$(PREFIX)-master.$(GCE_REGION).$(GCE_PROJECT) ssh -o LogLevel=quiet -o StrictHostKeyChecking=no $(PREFIX)-$* cat /var/log/calico/cni/cni.log > timings/cni-$*.log &
 	-ssh -A -o LogLevel=quiet core@$(PREFIX)-master.$(GCE_REGION).$(GCE_PROJECT) ssh -o LogLevel=quiet -o StrictHostKeyChecking=no $(PREFIX)-$* journalctl --no-pager > timings/journal-$*.log &
+	-ssh -A -o LogLevel=quiet core@$(PREFIX)-master.$(GCE_REGION).$(GCE_PROJECT) ssh -o LogLevel=quiet -o StrictHostKeyChecking=no $(PREFIX)-$* sudo /home/core/getcdiags.sh > timings/diags-$*.tgz &
 	-gcloud compute instances get-serial-port-output $(PREFIX)-$* > timings/serial-$*.log
 
-.PHONEY: $(LOG_RETRIEVAL_TARGETS)
+describe-nodes:
+	-kubectl describe nodes > timings/describe-nodes.log
 
-.PHONEY: render-templates
+describe-pods:
+	-kubectl describe pods > timings/describe-pods.log
+
+describe-services:
+	-kubectl describe services > timings/describe-services.log
+
+describe-rc:
+	-kubectl describe rc > timings/describe-rc.log
+
+describe-ep:
+	-kubectl describe ep > timings/describe-ep.log
+
+.PHONY: $(LOG_RETRIEVAL_TARGETS)
+
+.PHONY: render-templates
 render-templates: $(TEMPLATED_OUTPUT)
 
 build/$(GCE_BUCKET).created:
@@ -195,6 +238,7 @@ gce-create: kubectl calicoctl $(TEMPLATED_OUTPUT)
 	$(MAKE) --no-print-directory deploy-master
 	$(MAKE) --no-print-directory deploy-prom
 	$(MAKE) --no-print-directory deploy-etcd
+	$(MAKE) --no-print-directory deploy-rr
 	$(MAKE) --no-print-directory deploy-nodes
 	$(MAKE) --no-print-directory gce-config-ssh
 	$(MAKE) --no-print-directory gce-forward-ports
@@ -214,8 +258,8 @@ deploy-master:
 	  echo "master node started."
 
 deploy-nodes:
-	-gcloud compute instances create \
-	  $(NODE_NAMES) \
+	echo $(NODE_NAMES) | xargs -n250 | xargs -I{} sh -c 'gcloud compute instances create \
+	  {} \
 	  --zone $(GCE_REGION) \
 	  --image-project coreos-cloud \
 	  --image $(GCE_IMAGE_NAME) \
@@ -223,9 +267,10 @@ deploy-nodes:
 	  --metadata-from-file user-data=build/node-config-template.yaml \
 	  --no-address \
 	  --tags no-ip & \
-	  echo "Waiting for creation of worker nodes to finish..."; \
-	  wait; \
-	  echo "worker nodes started."
+	  echo "Waiting for creation of this batch of worker nodes to finish..."; \
+		wait; \
+		echo "Batch of nodes created. Waiting 120s for cluster to settle down..."; \
+	  sleep 120;'
 
 deploy-prom:
 	-gcloud compute instances create \
@@ -240,6 +285,20 @@ deploy-prom:
 	  echo "Waiting for creation of prometheus node to finish..."; \
 	  wait; \
 	  echo "prometheus node started."
+
+deploy-rr:
+	-gcloud compute instances create \
+	  $(PREFIX)-rr1 $(PREFIX)-rr2  \
+	  --image-project coreos-cloud \
+	  --zone $(GCE_REGION) \
+	  --image $(GCE_IMAGE_NAME) \
+	  --machine-type $(RR_INSTANCE_TYPE) \
+	  --metadata-from-file user-data=build/rr-template.yaml \
+	  --no-address \
+	  --tags no-ip & \
+	  echo "Waiting for creation of route reflector node to finish..."; \
+	  wait; \
+	  echo "route reflector node started."
 
 remove-prom:
 	gcloud compute instances delete --zone $(GCE_REGION) $(PREFIX)-prom
@@ -264,6 +323,7 @@ build/%: templates/% Makefile local-settings.mk build/calico-cni-url build/grafa
 	  sed "s~__CLUSTER_PREFIX__~$(PREFIX)~g" | \
 	  sed "s~__GCE_PROJECT__~$(GCE_PROJECT)~g" | \
 	  sed "s~__NODE_IMAGE__~$(NODE_IMAGE)~g" | \
+	  sed "s~__GETTER_IMAGE__~$(GETTER_IMAGE)~g" | \
 	  sed "s~__CNI_PLUGIN_URL__~$$(cat build/calico-cni-url)~g" | \
 	  sed "s~__GRAFANA_DB_URL__~$(GRAFANA_DB_URL)~g" | \
 	  sed "s~__GRAFANA_DASH_JSON_URL__~$$(cat build/grafana-json-url)~g" | \
@@ -344,4 +404,4 @@ gce-failed-pods:
 	kubectl get po |grep -v Pending |grep -v Running
 
 gce-wait-for-pod-creation:
-	bash -c 'while [ $$(kubectl get po | grep -P -c "1/1\s+Running\s+0") -ne $(PODS) ] ;  do date; echo "Not enough nodes created - waiting"; kubectl describe rc |grep "Pods Status"; sleep 1;done'
+	bash -c 'while [ $$(kubectl get po | grep -P -c "1/1\s+Running\s+0") -ne $(NUM_PODS) ] ;  do date; echo "Not enough nodes created - waiting"; kubectl describe rc |grep "Pods Status"; sleep 1;done'
